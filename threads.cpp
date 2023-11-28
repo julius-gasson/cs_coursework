@@ -1,80 +1,245 @@
 #include <thread>
 #include <iostream>
-#include <semaphore>
 #include <queue>
-#include <random>
-#include <chrono>
+#include <sstream>
+#include <semaphore>
 
 using namespace std;
 
-//The buffer
-queue<int> buffer;
+int queueSize;
+int noJobs;
+int noProducers;
+int noConsumers;
 
-//Semaphores
-
-int randInt(int lowerBound, int upperBound) {
-    // Seed the random number generator
-    random_device rd;
-    mt19937 gen(rd());
-
-    //Define the range for the random number
-    uniform_int_distribution<> distribution(lowerBound, upperBound);
-
-    // Output the random number
-    return distribution(gen);
-}
-
-
-void consumerFunction() {
-    // Wait 10 seconds for empty slot
-    bool queue_empty = false;
-    while (queue_empty) {
-        // if 10_seconds_passed
-            // kill thread
+class CircularQueue {
+private:
+  int rear, front, size;
+  int* items;
+public:
+  CircularQueue(int inputSize): size(inputSize) {
+      front = -1; // invalid default value
+      rear = -1; // invalid default value
+      try {
+	items = new int[size];
+      } catch (const bad_alloc& e) {
+	cerr << "Error: " << e.what() << '\n';
+	exit(1);
+      }
+      for (int i = 0; i < size; i++)
+	items[i] = -1;
     }
-    cout << "Consumer thread with id " << this_thread::get_id();
-    cout << " accesses the buffer\n";
-    int queueFront = buffer.front(); // get first job from buffer
-    buffer.pop(); // delete job from the buffer
-    // Sleep for the duration of time specified in the buffer
-    auto sleepTime = std::chrono::seconds(queueFront);
-    cout << "Consumer thread with id " << this_thread::get_id();
-    cout << " sleeps for " << queueFront << " seconds\n";
+ 
+  void enQueue(int value) {
+    if (front == 0 && rear == size-1) {
+      cerr << "Error: tried to enQueue into full queue";
+      exit(1);
+    }
+    else if (front == -1) { // Array is empty
+      front = 0;
+      rear = 0; // = front of array
+      items[rear] = value;
+    }
+    else if (rear == size-1 && front != 0) {
+      rear = 0; // wrap
+      items[rear] = value;
+    }
+    else {
+      rear++;
+      items[rear] = value;
+    }
+  }
+  int deQueue() {
+    if (front == -1) {
+      cerr << "Error: tried to deQueue from empty queue \n";
+      exit(1);
+    }
+    int front_value = items[front];
+    items[front] = -1; // invalid value
+    if (front == rear) {
+      front = -1; // invalid value
+      rear = -1; // invalid value
+    }
+    else {
+      front++;
+    }
+    if (front == size)
+      front = 0; // wrap
+    return front_value;
+  }
+
+  void queueToSstream(stringstream& outstream) {
+    outstream << "Buffer is: {";
+    int i = 0;
+    do {
+	if (i == front)
+	  outstream << "front: ";
+	if (i == rear)
+	  outstream << "rear: ";
+	outstream << items[i] << ", ";
+    } while (++i < size-1);
+    if (i == front)
+       outstream << "front: ";
+    if (i == rear)
+       outstream << "rear: ";
+    outstream << items[size-1] << "}\n";
+  }
+
+  void clear() {
+    delete[] items;
+  }
+};
+
+/* Global mutex for buffer access */
+binary_semaphore bufferMutex(1);
+
+void consumer(CircularQueue& buffer, counting_semaphore<1000>& item, counting_semaphore<1000>& space) {
+    /* Announce thread creation */
+    stringstream outstream;
+    outstream << "Consumer thread with id "  << this_thread::get_id() << " created\n";
+    cout << outstream.str();
+    outstream.str("");
+    if (!item.try_acquire_for(10s)) {
+        /* Timeout */
+        outstream << "Consumer thread with id " << this_thread::get_id();
+        outstream << " times out\n";
+        cout << outstream.str();
+        return;
+    }
+    bufferMutex.acquire();
+    int queueFront = buffer.deQueue(); // pop first job from the buffer
+
+    /* Announce successful consumer entry to the buffer. This is done before the
+        semaphores are released since it needs to read from the critical
+        section in order to write the buffer contents to the console
+    */
+    outstream << "Consumer thread with id " << this_thread::get_id()
+    << " takes " << queueFront << " from the front of the buffer\n";
+    buffer.queueToSstream(outstream);
+    cout << outstream.str();
+    outstream.str("");
+
+    /* Release semaphores */
+    bufferMutex.release(); // up(mutex)
+    space.release(); // up(space)
+
+
+
+    /* Announce sleep */
+    outstream << "Consumer thread with id " << this_thread::get_id()
+    << " sleeps for " << queueFront << " seconds\n";
+    cout << outstream.str();
+
+    /* "Consume" the item */
+    auto sleepTime = chrono::seconds(queueFront);
     this_thread::sleep_for(sleepTime);
 }
 
-counting_semaphore<> space;
-counting_semaphore<> item(0);
-binary_semaphore bufferMutex;
+void producer(CircularQueue& buffer, counting_semaphore<1000>& item, counting_semaphore<1000>& space) {
+    /* Announce thread creation */
+    stringstream outstream;
+    outstream << "Producer thread with id " << this_thread::get_id() << " created\n";
+    cout << outstream.str();
+    outstream.str("");
 
-void producerFunction() {
-    bool queue_full = false;
-    while (queue_full) {
-        // if 10_seconds_passed
-            // kill thread
+    for (int jobsDone = 0; jobsDone < noJobs; jobsDone++) {
+        int newNumber = rand() % 10 + 1;
+        if (!space.try_acquire_for(10s)) { // down(mutex)
+            /* Timeout */
+            outstream << "Producer thread with id " << this_thread::get_id()
+            << " times out\n";
+            cout << outstream.str();
+            return;
+        }
+        bufferMutex.acquire(); // down(mutex)
+        buffer.enQueue(newNumber); // Add random int to the front of the queue
+
+	/* Announce successful entry to the buffer */
+        outstream << "Producer thread with id " << this_thread::get_id()
+        << " adds " << newNumber
+        << " to the rear of the buffer\n";
+	buffer.queueToSstream(outstream);
+        cout << outstream.str();
+        outstream.str("");
+
+        /* Release semaphores */
+        bufferMutex.release(); // up(mutex)
+        item.release(); // up(item)
     }
-    // Produce item
-    int newNumber = (randInt(1, 10));
-    
-    // down(space): check if space left in queue
-    // down(mutex): test and set the lock
-
-    cout << "Consumer thread with id " << this_thread::get_id();
-    cout << " accesses the buffer\n";
-
-    buffer.push(newNumber);
-
-    cout << "Producer thread with id " << this_thread::get_id();
-    cout << " adds " << newNumber << " to the front of the buffer\n";
 }
 
+int main(int argc, char* argv[]) {
+    /* Test validity of command line arguments */
+    if (argc != 5) { // Includes the executable
+        cerr << "Error: submitted " << argc << " arguments: ";
+        for (int i = 0; i < argc; i++) cout << argv[i] << " ";
+        cerr << "\nMust submit 4 arguments in addition to the executable\n";
+        return 1;
+    }
+    /* Error handling for individual command line arguments */
+    for (int i = 1; i < argc; i++) {
+        char* arg = argv[i];
+        for (int index = 0; arg[index]; index++) {
+            if (!isdigit(arg[index])) {
+                cerr << "Error: all command-line args must be positive integers\n";
+                return 1;
+            }
+        }
+        if (atoi(arg) == 0) {
+            cerr << "Error: command-line args cannot be 0\n";
+            return 1;
+        }
+        if (atoi(arg) >= 1000) {
+            cerr << "Error: all command-line args must be below 1000\n";
+            return 1;
+        }
+    }
 
-int main(const int queueSize, int noJobs, int noProducers, int noConsumers) {
-    // Initialise semaphores
-    // mutex bufferMutex;
-    static counting_semaphore<> space(queueSize);
-    static counting_semaphore<> item(0);
+    /* Initialise variables */
+    queueSize = atoi(argv[1]);
+    noJobs = atoi(argv[2]);
+    noProducers = atoi(argv[3]);
+    noConsumers = atoi(argv[4]);
 
-    thread producer(producerFunction);
-    thread consumer(consumerFunction);
+    /* Announce variable initialisation */
+    cout << "Queue size: " << queueSize << '\n';
+    cout << "Number of jobs: " << noJobs << '\n';
+    cout << "Number of producers: " << noProducers << '\n';
+    cout << "Number of consumers: " << noConsumers << '\n';
+    cout << '\n';
+
+    /* Create circular queue */
+    CircularQueue buffer(queueSize);
+
+    /* Create counting semaphores*/
+    counting_semaphore<1000> item(0);
+    counting_semaphore<1000> space(queueSize);
+
+    /* Producer and consumer vectors */
+    vector<thread> all_producers;
+    vector<thread> all_consumers;
+
+    /* Populate producer and consumer vectors, and start threads */
+    try {
+        for (int i = 0; i < noProducers; i++) {
+        all_producers.push_back(thread(producer, ref(buffer), ref(item), ref(space)));
+        }
+        for (int i = 0; i < noProducers; i++) {
+        all_consumers.push_back(thread(consumer, ref(buffer), ref(item), ref(space)));
+        }
+
+        /* Join all threads */
+        for (unsigned int i = 0; i < all_producers.size(); i++) {
+            all_producers[i].join();
+        }
+        for (unsigned int i = 0; i < all_producers.size(); i++) {
+            all_consumers[i].join();
+        }
+    } catch (const std::system_error& e) {
+        cerr << "Error when creating thread: " << e.what() << '\n';
+    }
+
+    buffer.clear();
+   
+    /* exit */
+    return 0;
 }
